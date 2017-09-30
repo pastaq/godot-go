@@ -5,6 +5,13 @@ import (
 	"log"
 )
 
+// NewPongSprite is a constructor for PongSrpite
+func NewPongSprite() godot.Class {
+	pongSprite := &PongSprite{}
+
+	return pongSprite
+}
+
 // NewPongClass is a constructor that we can pass to godot.
 func NewPongClass() godot.Class {
 	pongClass := &PongClass{
@@ -12,6 +19,15 @@ func NewPongClass() godot.Class {
 	}
 
 	return pongClass
+}
+
+type PongSprite struct {
+	godot.Sprite
+}
+
+func (p *PongSprite) X_ready() {
+	godot.Log.Warning("***pongSprite***")
+	godot.Log.Warning(p)
 }
 
 // PongClass is a simple go struct that can be attached to a Godot Node2D object.
@@ -33,17 +49,23 @@ func (p *PongClass) X_ready() {
 	// Get the left paddle node.
 	godot.Log.Warning("***Get Left***")
 	left := p.GetNode(godot.NewNodePath("left"))
-
+	godot.Log.Warning("***Get Right***")
+	right := p.GetNode(godot.NewNodePath("right"))
 	// Troubleshooting
+
 	godot.Log.Warning("***pongClass***")
 	godot.Log.Warning(p)
 	godot.Log.Warning("***left***")
 	godot.Log.Warning(left)
+	godot.Log.Warning("***right***")
+	godot.Log.Warning(right)
 
 	godot.Log.Warning("***pongClass Owner***")
 	godot.Log.Warning(p.GetOwner())
 	godot.Log.Warning("***Left Owner***")
 	godot.Log.Warning(left.GetOwner())
+	godot.Log.Warning("***Right Owner***")
+	godot.Log.Warning(right.GetOwner())
 
 	godot.Log.Warning("***pongClass Name***")
 	godot.Log.Warning(p.GetName())
@@ -54,13 +76,15 @@ func (p *PongClass) X_ready() {
 	godot.Log.Warning(p.GetClass())
 	godot.Log.Warning("***Left Class***")
 	godot.Log.Warning(left.GetClass())
+
 }
 
-//func (p *PongClass) X_process(delta float64) {
-//	godot.Log.Println("Processing in pong.go!")
-//	godot.Log.Println("  Delta:", delta)
-//}
-
+/*
+func (p *PongClass) X_process(delta float64) {
+	godot.Log.Println("Processing in pong.go!")
+	godot.Log.Println("  Delta:", delta)
+}
+*/
 func (p *PongClass) CustomThing(myPhrase string) string {
 	godot.Log.Println(myPhrase)
 	return "The phrase: '" + myPhrase + "' was returned ."
@@ -75,6 +99,7 @@ func init() {
 	})
 
 	// Register will register the given class constructor with Godot.
+	godot.Register(NewPongSprite)
 	godot.Register(NewPongClass)
 }
 

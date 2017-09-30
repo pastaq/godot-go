@@ -26,7 +26,7 @@ func NewRID() *RID {
 func NewRIDWithResource(object Class) *RID {
 	rid := &RID{}
 	var gdRID C.godot_rid
-	C.godot_rid_new_with_resource(&gdRID, unsafe.Pointer(object.getOwner()))
+	C.godot_rid_new_with_resource(&gdRID, unsafe.Pointer(object.getGDObj()))
 	rid.rid = &gdRID
 
 	return rid

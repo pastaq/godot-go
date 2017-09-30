@@ -40,8 +40,8 @@ import (
 // inheritance.
 type Class interface {
 	baseClass() string
-	setOwner(object *C.godot_object)
-	getOwner() *C.godot_object
+	setGDObj(object *C.godot_object)
+	getGDObj() *C.godot_object
 }
 
 {{ range $i, $class := $view.APIs -}}
@@ -50,7 +50,7 @@ type Class interface {
             func newSingleton{{ $view.GoClassName $class.Name }}() *{{ $view.SetClassName $class.Name $class.Singleton}} {
                 obj := &{{ $view.SetClassName $class.Name $class.Singleton }}{}
                 ptr := C.godot_global_get_singleton(C.CString("{{ $class.Name }}"))
-                obj.owner = (*C.godot_object)(ptr)
+                obj.gdObj = (*C.godot_object)(ptr)
                 return obj
             }
             /*
@@ -64,7 +64,7 @@ type Class interface {
         type {{ $view.SetClassName $class.Name $class.Singleton }} struct {
             {{ $view.SetBaseClassName $class.BaseClass }}
             {{ if eq $class.Name "Object" }}
-                owner *C.godot_object
+                gdObj *C.godot_object
             {{ end }}
         }
 
@@ -111,12 +111,12 @@ type Class interface {
         {{ if eq $class.Name "Object" }}
             // SetOwner will internally set the Godot object inside the struct.
             // This is used to call parent methods.
-            func (o *Object) setOwner(object *C.godot_object) {
-                o.owner = object
+            func (o *Object) setGDObj(object *C.godot_object) {
+                o.gdObj = object
             }
             
-            func (o *Object) getOwner() *C.godot_object {
-                return o.owner
+            func (o *Object) getGDObj() *C.godot_object {
+                return o.gdObj
             }
 
             // callParentMethod will call this object's method with the given method name.
@@ -129,9 +129,9 @@ type Class interface {
             	log.Println("  Using method name: ", methodName)
             	methodCString := C.CString(methodName)
             
-                // Get the Godot objects owner so we can pass it to godot_method_bind_ptrcall.
-            	log.Println("  Using godot object owner:", o.getOwner())
-                objectOwner := unsafe.Pointer(o.getOwner())
+                // Get the Godot object so we can pass it to godot_method_bind_ptrcall.
+            	log.Println("  Using godot object:", o.gdObj)
+                gdObjPtr := unsafe.Pointer(o.gdObj)
 
             	// Get the Godot method bind pointer so we can pass it to godot_method_bind_ptrcall.
             	var methodBind *C.godot_method_bind
@@ -180,7 +180,7 @@ type Class interface {
             	log.Println("  Calling bind_ptrcall...")
             	C.godot_method_bind_ptrcall(
             		methodBind,
-            		objectOwner,
+            		gdObjPtr,
                     cArgsArray, // void**
             		ret,        // void*
             	)
@@ -318,9 +318,9 @@ var godotToGoConversionMap = map[string]godotToGoConverter{
     {{ range $i, $class := $view.APIs -}}
         {{ if $view.IsValidClass $class.Name $class.BaseClass -}}
             "*{{ $view.SetClassName $class.Name $class.Singleton }}": func(gdObject unsafe.Pointer) reflect.Value {
-            	owner := (*C.godot_object)(gdObject)
+            	gdObj := (*C.godot_object)(gdObject)
                 goObject := &{{ $view.SetClassName $class.Name $class.Singleton }}{}
-                goObject.setOwner(owner)
+                goObject.setGDObj(gdObj)
 
                 return reflect.ValueOf(goObject)
             },

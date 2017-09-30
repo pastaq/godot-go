@@ -250,7 +250,7 @@ func go_create_func(godotObject *C.godot_object, methodData unsafe.Pointer) unsa
 	log.Println("Created new object instance:", class, "with instance address:", instanceString)
 
 	// Add the Godot object pointer to the class structure.
-	class.setOwner(godotObject)
+	class.setGDObj(godotObject)
 
 	// Add the instance to our instance registry.
 	instanceRegistry[instanceString] = class

@@ -37,24 +37,30 @@ void add_element(void **array, void *element, int index) {
 import "C"
 
 import (
+	"fmt"
 	"log"
 	"reflect"
 	"unsafe"
 )
 
+// ObjectMap is a map of all our objects. This is so Go Garbage colelction doesn't
+// fuck us.
+var objectMap = map[string]C.godot_object{}
+var objectPtrMap = map[string]*C.godot_object{}
+
 // Class is an interface for any objects that can have Godot
 // inheritance.
 type Class interface {
 	baseClass() string
-	setOwner(object *C.godot_object)
-	getOwner() *C.godot_object
+	setGDObj(object *C.godot_object)
+	getGDObj() *C.godot_object
 }
 
 /*
    Base class for all non built-in types. Everything not a built-in type starts the inheritance chain from this class. Objects do not manage memory, if inheriting from one the object will most likely have to be deleted manually (call the [method free] function from the script or delete from C++). Some derivates add memory management, such as [Reference] (which keeps a reference count and deletes itself automatically when no longer referenced) and [Node], which deletes the children tree when deleted. Objects export properties, which are mainly useful for storage and editing, but not really so much in programming. Properties are exported in [method _get_property_list] and handled in [method _get] and [method _set]. However, scripting languages and C++ have simpler means to export them. Objects also receive notifications ([method _notification]). Notifications are a simple way to notify the object about simple events, so they can all be handled together.
 */
 type Object struct {
-	owner *C.godot_object
+	gdObj *C.godot_object
 }
 
 func (o *Object) baseClass() string {
@@ -863,12 +869,12 @@ func (o *Object) IsQueuedForDeletion() bool {
 
 // SetOwner will internally set the Godot object inside the struct.
 // This is used to call parent methods.
-func (o *Object) setOwner(object *C.godot_object) {
-	o.owner = object
+func (o *Object) setGDObj(object *C.godot_object) {
+	o.gdObj = object
 }
 
-func (o *Object) getOwner() *C.godot_object {
-	return o.owner
+func (o *Object) getGDObj() *C.godot_object {
+	return o.gdObj
 }
 
 // callParentMethod will call this object's method with the given method name.
@@ -881,9 +887,9 @@ func (o *Object) callParentMethod(baseClass, methodName string, args []reflect.V
 	log.Println("  Using method name: ", methodName)
 	methodCString := C.CString(methodName)
 
-	// Get the Godot objects owner so we can pass it to godot_method_bind_ptrcall.
-	log.Println("  Using godot object owner:", o.getOwner())
-	objectOwner := unsafe.Pointer(o.getOwner())
+	// Get the Godot object so we can pass it to godot_method_bind_ptrcall.
+	log.Println("  Using godot object:", o.gdObj)
+	gdObjPtr := unsafe.Pointer(o.gdObj)
 
 	// Get the Godot method bind pointer so we can pass it to godot_method_bind_ptrcall.
 	var methodBind *C.godot_method_bind
@@ -895,6 +901,7 @@ func (o *Object) callParentMethod(baseClass, methodName string, args []reflect.V
 	// TODO: Probably pull this out into its own function?
 	variantArgs := []unsafe.Pointer{}
 	for _, arg := range args {
+		log.Println("  Argument: ", arg)
 		log.Println("  Argument type: ", arg.Type().String())
 
 		// Look up our conversion function in our map of conversion functions
@@ -914,7 +921,12 @@ func (o *Object) callParentMethod(baseClass, methodName string, args []reflect.V
 
 	// Construct a C array that will contain pointers to our arguments.
 	log.Println("  Allocating argument array in C.")
-	cArgsArray := C.build_array(C.int(len(variantArgs)))
+	var cArgsArray *unsafe.Pointer
+	if len(variantArgs) > 0 {
+		cArgsArray = C.build_array(C.int(len(variantArgs)))
+		defer C.free(*cArgsArray)
+	}
+
 	log.Println("    C Array: ", cArgsArray)
 
 	// Loop through and add each argument to our C args array.
@@ -926,17 +938,47 @@ func (o *Object) callParentMethod(baseClass, methodName string, args []reflect.V
 	// Construct our return object that will be populated by the method call.
 	// Here we're just using a CString
 	log.Println("  Building return value.")
-	ret := unsafe.Pointer(C.CString(""))
+
+	// this is a test for heaping the variable
+	var ret unsafe.Pointer
+
+	switch returns {
+	case "*Node":
+		retObj := new(C.godot_object)
+		ret = unsafe.Pointer(retObj)
+
+		objectMap[fmt.Sprint(retObj)] = *retObj
+		objectPtrMap[fmt.Sprint(retObj)] = retObj
+
+	case "*NodePath":
+		retObj := new(C.godot_node_path)
+		ret = unsafe.Pointer(retObj)
+
+	case "*Rect2":
+		retObj := new(C.godot_rect2)
+		ret = unsafe.Pointer(retObj)
+
+	case "string":
+		retObj := C.CString("")
+		ret = unsafe.Pointer(retObj)
+
+	default:
+		retObj := new(C.godot_object)
+		ret = unsafe.Pointer(retObj)
+
+	}
 
 	// Call the parent method. "ret" will be populated with the return value.
 	log.Println("  Calling bind_ptrcall...")
 	C.godot_method_bind_ptrcall(
 		methodBind,
-		objectOwner,
+		gdObjPtr,
 		cArgsArray, // void**
 		ret,        // void*
 	)
 	log.Println("  Finished calling method")
+
+	log.Println("  Return: ", ret)
 
 	// Convert the return value based on the type.
 	var retValue reflect.Value
@@ -945,6 +987,8 @@ func (o *Object) callParentMethod(baseClass, methodName string, args []reflect.V
 	} else {
 		panic("Return type not found when calling parent method: " + returns)
 	}
+	log.Println("  Return Value: ", retValue)
+	log.Println("  Return Value: ", retValue.Type().String())
 
 	// Return the converted variant.
 	return retValue
@@ -5358,7 +5402,7 @@ type StreamPeerSSLImplementer interface {
 func newSingletonIP() *ip {
 	obj := &ip{}
 	ptr := C.godot_global_get_singleton(C.CString("IP"))
-	obj.owner = (*C.godot_object)(ptr)
+	obj.gdObj = (*C.godot_object)(ptr)
 	return obj
 }
 
@@ -10021,7 +10065,7 @@ type IP_UnixImplementer interface {
 func newSingletonGeometry() *geometry {
 	obj := &geometry{}
 	ptr := C.godot_global_get_singleton(C.CString("_Geometry"))
-	obj.owner = (*C.godot_object)(ptr)
+	obj.gdObj = (*C.godot_object)(ptr)
 	return obj
 }
 
@@ -10510,7 +10554,7 @@ func (o *geometry) MakeAtlas(sizes *PoolVector2Array) *Dictionary {
 func newSingletonResourceLoader() *resourceLoader {
 	obj := &resourceLoader{}
 	ptr := C.godot_global_get_singleton(C.CString("_ResourceLoader"))
-	obj.owner = (*C.godot_object)(ptr)
+	obj.gdObj = (*C.godot_object)(ptr)
 	return obj
 }
 
@@ -10659,7 +10703,7 @@ func (o *resourceLoader) Has(path string) bool {
 func newSingletonResourceSaver() *resourceSaver {
 	obj := &resourceSaver{}
 	ptr := C.godot_global_get_singleton(C.CString("_ResourceSaver"))
-	obj.owner = (*C.godot_object)(ptr)
+	obj.gdObj = (*C.godot_object)(ptr)
 	return obj
 }
 
@@ -10726,7 +10770,7 @@ func (o *resourceSaver) GetRecognizedExtensions(aType *Resource) *PoolStringArra
 func newSingletonOS() *os {
 	obj := &os{}
 	ptr := C.godot_global_get_singleton(C.CString("_OS"))
-	obj.owner = (*C.godot_object)(ptr)
+	obj.gdObj = (*C.godot_object)(ptr)
 	return obj
 }
 
@@ -12623,7 +12667,7 @@ func (o *os) GetPowerPercentLeft() int64 {
 func newSingletonEngine() *engine {
 	obj := &engine{}
 	ptr := C.godot_global_get_singleton(C.CString("_Engine"))
-	obj.owner = (*C.godot_object)(ptr)
+	obj.gdObj = (*C.godot_object)(ptr)
 	return obj
 }
 
@@ -12898,7 +12942,7 @@ func (o *engine) IsEditorHint() bool {
 func newSingletonClassDB() *classDb {
 	obj := &classDb{}
 	ptr := C.godot_global_get_singleton(C.CString("_ClassDB"))
-	obj.owner = (*C.godot_object)(ptr)
+	obj.gdObj = (*C.godot_object)(ptr)
 	return obj
 }
 
@@ -13354,7 +13398,7 @@ func (o *classDb) IsClassEnabled(class string) bool {
 func newSingletonMarshalls() *marshalls {
 	obj := &marshalls{}
 	ptr := C.godot_global_get_singleton(C.CString("_Marshalls"))
-	obj.owner = (*C.godot_object)(ptr)
+	obj.gdObj = (*C.godot_object)(ptr)
 	return obj
 }
 
@@ -13503,7 +13547,7 @@ func (o *marshalls) Base64ToUtf8(base64Str string) string {
 func newSingletonJSON() *json {
 	obj := &json{}
 	ptr := C.godot_global_get_singleton(C.CString("_JSON"))
-	obj.owner = (*C.godot_object)(ptr)
+	obj.gdObj = (*C.godot_object)(ptr)
 	return obj
 }
 
@@ -13568,7 +13612,7 @@ func (o *json) Parse(json string) *JSONParseResult {
 func newSingletonProjectSettings() *projectSettings {
 	obj := &projectSettings{}
 	ptr := C.godot_global_get_singleton(C.CString("ProjectSettings"))
-	obj.owner = (*C.godot_object)(ptr)
+	obj.gdObj = (*C.godot_object)(ptr)
 	return obj
 }
 
@@ -13895,7 +13939,7 @@ func (o *projectSettings) SaveCustom(file string) int64 {
 func newSingletonInputMap() *inputMap {
 	obj := &inputMap{}
 	ptr := C.godot_global_get_singleton(C.CString("InputMap"))
-	obj.owner = (*C.godot_object)(ptr)
+	obj.gdObj = (*C.godot_object)(ptr)
 	return obj
 }
 
@@ -14115,7 +14159,7 @@ func (o *inputMap) LoadFromGlobals() {
 func newSingletonTranslationServer() *translationServer {
 	obj := &translationServer{}
 	ptr := C.godot_global_get_singleton(C.CString("TranslationServer"))
-	obj.owner = (*C.godot_object)(ptr)
+	obj.gdObj = (*C.godot_object)(ptr)
 	return obj
 }
 
@@ -14250,7 +14294,7 @@ func (o *translationServer) Clear() {
 func newSingletonPerformance() *performance {
 	obj := &performance{}
 	ptr := C.godot_global_get_singleton(C.CString("Performance"))
-	obj.owner = (*C.godot_object)(ptr)
+	obj.gdObj = (*C.godot_object)(ptr)
 	return obj
 }
 
@@ -14294,7 +14338,7 @@ func (o *performance) GetMonitor(monitor int64) float64 {
 func newSingletonVisualServer() *visualServer {
 	obj := &visualServer{}
 	ptr := C.godot_global_get_singleton(C.CString("VisualServer"))
-	obj.owner = (*C.godot_object)(ptr)
+	obj.gdObj = (*C.godot_object)(ptr)
 	return obj
 }
 
@@ -14494,7 +14538,7 @@ type PhysicsServerSWImplementer interface {
 func newSingletonPhysicsServer() *physicsServer {
 	obj := &physicsServer{}
 	ptr := C.godot_global_get_singleton(C.CString("PhysicsServer"))
-	obj.owner = (*C.godot_object)(ptr)
+	obj.gdObj = (*C.godot_object)(ptr)
 	return obj
 }
 
@@ -17273,7 +17317,7 @@ type Physics2DServerSWImplementer interface {
 func newSingletonPhysics2DServer() *physics2DServer {
 	obj := &physics2DServer{}
 	ptr := C.godot_global_get_singleton(C.CString("Physics2DServer"))
-	obj.owner = (*C.godot_object)(ptr)
+	obj.gdObj = (*C.godot_object)(ptr)
 	return obj
 }
 
@@ -19585,7 +19629,7 @@ type Physics2DDirectBodyStateImplementer interface {
 func newSingletonAudioServer() *audioServer {
 	obj := &audioServer{}
 	ptr := C.godot_global_get_singleton(C.CString("AudioServer"))
-	obj.owner = (*C.godot_object)(ptr)
+	obj.gdObj = (*C.godot_object)(ptr)
 	return obj
 }
 
@@ -20280,7 +20324,7 @@ type InputDefaultImplementer interface {
 func newSingletonInput() *input {
 	obj := &input{}
 	ptr := C.godot_global_get_singleton(C.CString("Input"))
-	obj.owner = (*C.godot_object)(ptr)
+	obj.gdObj = (*C.godot_object)(ptr)
 	return obj
 }
 
@@ -20986,7 +21030,7 @@ func (o *input) ParseInputEvent(event *InputEvent) {
 func newSingletonARVRServer() *arvrServer {
 	obj := &arvrServer{}
 	ptr := C.godot_global_get_singleton(C.CString("ARVRServer"))
-	obj.owner = (*C.godot_object)(ptr)
+	obj.gdObj = (*C.godot_object)(ptr)
 	return obj
 }
 
@@ -26255,596 +26299,6 @@ type PhysicsShapeQueryResultImplementer interface {
 }
 
 /*
-   Font contains a unicode compatible character set, as well as the ability to draw it with variable width, ascent, descent and kerning. For creating fonts from TTF files (or other font formats), see the editor support for fonts. TODO check wikipedia for graph of ascent/baseline/descent/height/etc.
-*/
-type Font struct {
-	Resource
-}
-
-func (o *Font) baseClass() string {
-	return "Font"
-}
-
-/*
-   Draw "string" into a canvas item using the font at a given position, with "modulate" color, and optionally clipping the width. "position" specifies the baseline, not the top. To draw from the top, [i]ascent[/i] must be added to the Y axis.
-*/
-func (o *Font) Draw(canvasItem *RID, pos *Vector2, string string, modulate *Color, clipW int64) {
-	log.Println("Calling Font.Draw()")
-
-	// Build out the method's arguments
-	goArguments := make([]reflect.Value, 5, 5)
-	goArguments[0] = reflect.ValueOf(canvasItem)
-	goArguments[1] = reflect.ValueOf(pos)
-	goArguments[2] = reflect.ValueOf(string)
-	goArguments[3] = reflect.ValueOf(modulate)
-	goArguments[4] = reflect.ValueOf(clipW)
-
-	// Call the parent method.
-
-	o.callParentMethod(o.baseClass(), "draw", goArguments, "")
-
-	log.Println("  Function successfully completed.")
-
-}
-
-/*
-   Return the font ascent (number of pixels above the baseline).
-*/
-func (o *Font) GetAscent() float64 {
-	log.Println("Calling Font.GetAscent()")
-
-	// Build out the method's arguments
-	goArguments := make([]reflect.Value, 0, 0)
-
-	// Call the parent method.
-
-	goRet := o.callParentMethod(o.baseClass(), "get_ascent", goArguments, "float64")
-
-	returnValue := goRet.Interface().(float64)
-
-	log.Println("  Got return value: ", returnValue)
-	return returnValue
-
-}
-
-/*
-   Return the font descent (number of pixels below the baseline).
-*/
-func (o *Font) GetDescent() float64 {
-	log.Println("Calling Font.GetDescent()")
-
-	// Build out the method's arguments
-	goArguments := make([]reflect.Value, 0, 0)
-
-	// Call the parent method.
-
-	goRet := o.callParentMethod(o.baseClass(), "get_descent", goArguments, "float64")
-
-	returnValue := goRet.Interface().(float64)
-
-	log.Println("  Got return value: ", returnValue)
-	return returnValue
-
-}
-
-/*
-   Return the total font height (ascent plus descent) in pixels.
-*/
-func (o *Font) GetHeight() float64 {
-	log.Println("Calling Font.GetHeight()")
-
-	// Build out the method's arguments
-	goArguments := make([]reflect.Value, 0, 0)
-
-	// Call the parent method.
-
-	goRet := o.callParentMethod(o.baseClass(), "get_height", goArguments, "float64")
-
-	returnValue := goRet.Interface().(float64)
-
-	log.Println("  Got return value: ", returnValue)
-	return returnValue
-
-}
-
-/*
-
- */
-func (o *Font) IsDistanceFieldHint() bool {
-	log.Println("Calling Font.IsDistanceFieldHint()")
-
-	// Build out the method's arguments
-	goArguments := make([]reflect.Value, 0, 0)
-
-	// Call the parent method.
-
-	goRet := o.callParentMethod(o.baseClass(), "is_distance_field_hint", goArguments, "bool")
-
-	returnValue := goRet.Interface().(bool)
-
-	log.Println("  Got return value: ", returnValue)
-	return returnValue
-
-}
-
-/*
-   Return the size of a string, taking kerning and advance into account.
-*/
-func (o *Font) GetStringSize(string string) *Vector2 {
-	log.Println("Calling Font.GetStringSize()")
-
-	// Build out the method's arguments
-	goArguments := make([]reflect.Value, 1, 1)
-	goArguments[0] = reflect.ValueOf(string)
-
-	// Call the parent method.
-
-	goRet := o.callParentMethod(o.baseClass(), "get_string_size", goArguments, "*Vector2")
-
-	returnValue := goRet.Interface().(*Vector2)
-
-	log.Println("  Got return value: ", returnValue)
-	return returnValue
-
-}
-
-/*
-   Draw character "char" into a canvas item using the font at a given position, with "modulate" color, and optionally kerning if "next" is passed. clipping the width. "position" specifies the baseline, not the top. To draw from the top, [i]ascent[/i] must be added to the Y axis. The width used by the character is returned, making this function useful for drawing strings character by character.
-*/
-func (o *Font) DrawChar(canvasItem *RID, pos *Vector2, char int64, next int64, modulate *Color) float64 {
-	log.Println("Calling Font.DrawChar()")
-
-	// Build out the method's arguments
-	goArguments := make([]reflect.Value, 5, 5)
-	goArguments[0] = reflect.ValueOf(canvasItem)
-	goArguments[1] = reflect.ValueOf(pos)
-	goArguments[2] = reflect.ValueOf(char)
-	goArguments[3] = reflect.ValueOf(next)
-	goArguments[4] = reflect.ValueOf(modulate)
-
-	// Call the parent method.
-
-	goRet := o.callParentMethod(o.baseClass(), "draw_char", goArguments, "float64")
-
-	returnValue := goRet.Interface().(float64)
-
-	log.Println("  Got return value: ", returnValue)
-	return returnValue
-
-}
-
-/*
-   After editing a font (changing size, ascent, char rects, etc.). Call this function to propagate changes to controls that might use it.
-*/
-func (o *Font) UpdateChanges() {
-	log.Println("Calling Font.UpdateChanges()")
-
-	// Build out the method's arguments
-	goArguments := make([]reflect.Value, 0, 0)
-
-	// Call the parent method.
-
-	o.callParentMethod(o.baseClass(), "update_changes", goArguments, "")
-
-	log.Println("  Function successfully completed.")
-
-}
-
-/*
-   FontImplementer is an interface for Font objects.
-*/
-type FontImplementer interface {
-	Class
-}
-
-/*
-
- */
-type BitmapFont struct {
-	Font
-}
-
-func (o *BitmapFont) baseClass() string {
-	return "BitmapFont"
-}
-
-/*
-
- */
-func (o *BitmapFont) CreateFromFnt(path string) int64 {
-	log.Println("Calling BitmapFont.CreateFromFnt()")
-
-	// Build out the method's arguments
-	goArguments := make([]reflect.Value, 1, 1)
-	goArguments[0] = reflect.ValueOf(path)
-
-	// Call the parent method.
-
-	goRet := o.callParentMethod(o.baseClass(), "create_from_fnt", goArguments, "int64")
-
-	returnValue := goRet.Interface().(int64)
-
-	log.Println("  Got return value: ", returnValue)
-	return returnValue
-
-}
-
-/*
-   Set the total font height (ascent plus descent) in pixels.
-*/
-func (o *BitmapFont) SetHeight(px float64) {
-	log.Println("Calling BitmapFont.SetHeight()")
-
-	// Build out the method's arguments
-	goArguments := make([]reflect.Value, 1, 1)
-	goArguments[0] = reflect.ValueOf(px)
-
-	// Call the parent method.
-
-	o.callParentMethod(o.baseClass(), "set_height", goArguments, "")
-
-	log.Println("  Function successfully completed.")
-
-}
-
-/*
-   Set the font ascent (number of pixels above the baseline).
-*/
-func (o *BitmapFont) SetAscent(px float64) {
-	log.Println("Calling BitmapFont.SetAscent()")
-
-	// Build out the method's arguments
-	goArguments := make([]reflect.Value, 1, 1)
-	goArguments[0] = reflect.ValueOf(px)
-
-	// Call the parent method.
-
-	o.callParentMethod(o.baseClass(), "set_ascent", goArguments, "")
-
-	log.Println("  Function successfully completed.")
-
-}
-
-/*
-   Add a kerning pair to the [BitmapFont] as a difference. Kerning pairs are special cases where a typeface advance is determined by the next character.
-*/
-func (o *BitmapFont) AddKerningPair(charA int64, charB int64, kerning int64) {
-	log.Println("Calling BitmapFont.AddKerningPair()")
-
-	// Build out the method's arguments
-	goArguments := make([]reflect.Value, 3, 3)
-	goArguments[0] = reflect.ValueOf(charA)
-	goArguments[1] = reflect.ValueOf(charB)
-	goArguments[2] = reflect.ValueOf(kerning)
-
-	// Call the parent method.
-
-	o.callParentMethod(o.baseClass(), "add_kerning_pair", goArguments, "")
-
-	log.Println("  Function successfully completed.")
-
-}
-
-/*
-   Return a kerning pair as a difference.
-*/
-func (o *BitmapFont) GetKerningPair(charA int64, charB int64) int64 {
-	log.Println("Calling BitmapFont.GetKerningPair()")
-
-	// Build out the method's arguments
-	goArguments := make([]reflect.Value, 2, 2)
-	goArguments[0] = reflect.ValueOf(charA)
-	goArguments[1] = reflect.ValueOf(charB)
-
-	// Call the parent method.
-
-	goRet := o.callParentMethod(o.baseClass(), "get_kerning_pair", goArguments, "int64")
-
-	returnValue := goRet.Interface().(int64)
-
-	log.Println("  Got return value: ", returnValue)
-	return returnValue
-
-}
-
-/*
-   Add a texture to the [BitmapFont].
-*/
-func (o *BitmapFont) AddTexture(texture *Texture) {
-	log.Println("Calling BitmapFont.AddTexture()")
-
-	// Build out the method's arguments
-	goArguments := make([]reflect.Value, 1, 1)
-	goArguments[0] = reflect.ValueOf(texture)
-
-	// Call the parent method.
-
-	o.callParentMethod(o.baseClass(), "add_texture", goArguments, "")
-
-	log.Println("  Function successfully completed.")
-
-}
-
-/*
-   Add a character to the font, where [i]character[/i] is the unicode value, [i]texture[/i] is the texture index, [i]rect[/i] is the region in the texture (in pixels!), [i]align[/i] is the (optional) alignment for the character and [i]advance[/i] is the (optional) advance.
-*/
-func (o *BitmapFont) AddChar(character int64, texture int64, rect *Rect2, align *Vector2, advance float64) {
-	log.Println("Calling BitmapFont.AddChar()")
-
-	// Build out the method's arguments
-	goArguments := make([]reflect.Value, 5, 5)
-	goArguments[0] = reflect.ValueOf(character)
-	goArguments[1] = reflect.ValueOf(texture)
-	goArguments[2] = reflect.ValueOf(rect)
-	goArguments[3] = reflect.ValueOf(align)
-	goArguments[4] = reflect.ValueOf(advance)
-
-	// Call the parent method.
-
-	o.callParentMethod(o.baseClass(), "add_char", goArguments, "")
-
-	log.Println("  Function successfully completed.")
-
-}
-
-/*
-
- */
-func (o *BitmapFont) GetTextureCount() int64 {
-	log.Println("Calling BitmapFont.GetTextureCount()")
-
-	// Build out the method's arguments
-	goArguments := make([]reflect.Value, 0, 0)
-
-	// Call the parent method.
-
-	goRet := o.callParentMethod(o.baseClass(), "get_texture_count", goArguments, "int64")
-
-	returnValue := goRet.Interface().(int64)
-
-	log.Println("  Got return value: ", returnValue)
-	return returnValue
-
-}
-
-/*
-
- */
-func (o *BitmapFont) GetTexture(idx int64) *Texture {
-	log.Println("Calling BitmapFont.GetTexture()")
-
-	// Build out the method's arguments
-	goArguments := make([]reflect.Value, 1, 1)
-	goArguments[0] = reflect.ValueOf(idx)
-
-	// Call the parent method.
-
-	goRet := o.callParentMethod(o.baseClass(), "get_texture", goArguments, "*Texture")
-
-	returnValue := goRet.Interface().(*Texture)
-
-	log.Println("  Got return value: ", returnValue)
-	return returnValue
-
-}
-
-/*
-   Return the size of a character, optionally taking kerning into account if the next character is provided.
-*/
-func (o *BitmapFont) GetCharSize(char int64, next int64) *Vector2 {
-	log.Println("Calling BitmapFont.GetCharSize()")
-
-	// Build out the method's arguments
-	goArguments := make([]reflect.Value, 2, 2)
-	goArguments[0] = reflect.ValueOf(char)
-	goArguments[1] = reflect.ValueOf(next)
-
-	// Call the parent method.
-
-	goRet := o.callParentMethod(o.baseClass(), "get_char_size", goArguments, "*Vector2")
-
-	returnValue := goRet.Interface().(*Vector2)
-
-	log.Println("  Got return value: ", returnValue)
-	return returnValue
-
-}
-
-/*
-
- */
-func (o *BitmapFont) SetDistanceFieldHint(enable bool) {
-	log.Println("Calling BitmapFont.SetDistanceFieldHint()")
-
-	// Build out the method's arguments
-	goArguments := make([]reflect.Value, 1, 1)
-	goArguments[0] = reflect.ValueOf(enable)
-
-	// Call the parent method.
-
-	o.callParentMethod(o.baseClass(), "set_distance_field_hint", goArguments, "")
-
-	log.Println("  Function successfully completed.")
-
-}
-
-/*
-   Clear all the font data.
-*/
-func (o *BitmapFont) Clear() {
-	log.Println("Calling BitmapFont.Clear()")
-
-	// Build out the method's arguments
-	goArguments := make([]reflect.Value, 0, 0)
-
-	// Call the parent method.
-
-	o.callParentMethod(o.baseClass(), "clear", goArguments, "")
-
-	log.Println("  Function successfully completed.")
-
-}
-
-/*
-   Undocumented
-*/
-func (o *BitmapFont) X_SetChars(arg0 *PoolIntArray) {
-	log.Println("Calling BitmapFont.X_SetChars()")
-
-	// Build out the method's arguments
-	goArguments := make([]reflect.Value, 1, 1)
-	goArguments[0] = reflect.ValueOf(arg0)
-
-	// Call the parent method.
-
-	o.callParentMethod(o.baseClass(), "_set_chars", goArguments, "")
-
-	log.Println("  Function successfully completed.")
-
-}
-
-/*
-   Undocumented
-*/
-func (o *BitmapFont) X_GetChars() *PoolIntArray {
-	log.Println("Calling BitmapFont.X_GetChars()")
-
-	// Build out the method's arguments
-	goArguments := make([]reflect.Value, 0, 0)
-
-	// Call the parent method.
-
-	goRet := o.callParentMethod(o.baseClass(), "_get_chars", goArguments, "*PoolIntArray")
-
-	returnValue := goRet.Interface().(*PoolIntArray)
-
-	log.Println("  Got return value: ", returnValue)
-	return returnValue
-
-}
-
-/*
-   Undocumented
-*/
-func (o *BitmapFont) X_SetKernings(arg0 *PoolIntArray) {
-	log.Println("Calling BitmapFont.X_SetKernings()")
-
-	// Build out the method's arguments
-	goArguments := make([]reflect.Value, 1, 1)
-	goArguments[0] = reflect.ValueOf(arg0)
-
-	// Call the parent method.
-
-	o.callParentMethod(o.baseClass(), "_set_kernings", goArguments, "")
-
-	log.Println("  Function successfully completed.")
-
-}
-
-/*
-   Undocumented
-*/
-func (o *BitmapFont) X_GetKernings() *PoolIntArray {
-	log.Println("Calling BitmapFont.X_GetKernings()")
-
-	// Build out the method's arguments
-	goArguments := make([]reflect.Value, 0, 0)
-
-	// Call the parent method.
-
-	goRet := o.callParentMethod(o.baseClass(), "_get_kernings", goArguments, "*PoolIntArray")
-
-	returnValue := goRet.Interface().(*PoolIntArray)
-
-	log.Println("  Got return value: ", returnValue)
-	return returnValue
-
-}
-
-/*
-   Undocumented
-*/
-func (o *BitmapFont) X_SetTextures(arg0 *Array) {
-	log.Println("Calling BitmapFont.X_SetTextures()")
-
-	// Build out the method's arguments
-	goArguments := make([]reflect.Value, 1, 1)
-	goArguments[0] = reflect.ValueOf(arg0)
-
-	// Call the parent method.
-
-	o.callParentMethod(o.baseClass(), "_set_textures", goArguments, "")
-
-	log.Println("  Function successfully completed.")
-
-}
-
-/*
-   Undocumented
-*/
-func (o *BitmapFont) X_GetTextures() *Array {
-	log.Println("Calling BitmapFont.X_GetTextures()")
-
-	// Build out the method's arguments
-	goArguments := make([]reflect.Value, 0, 0)
-
-	// Call the parent method.
-
-	goRet := o.callParentMethod(o.baseClass(), "_get_textures", goArguments, "*Array")
-
-	returnValue := goRet.Interface().(*Array)
-
-	log.Println("  Got return value: ", returnValue)
-	return returnValue
-
-}
-
-/*
-
- */
-func (o *BitmapFont) SetFallback(fallback *BitmapFont) {
-	log.Println("Calling BitmapFont.SetFallback()")
-
-	// Build out the method's arguments
-	goArguments := make([]reflect.Value, 1, 1)
-	goArguments[0] = reflect.ValueOf(fallback)
-
-	// Call the parent method.
-
-	o.callParentMethod(o.baseClass(), "set_fallback", goArguments, "")
-
-	log.Println("  Function successfully completed.")
-
-}
-
-/*
-
- */
-func (o *BitmapFont) GetFallback() *BitmapFont {
-	log.Println("Calling BitmapFont.GetFallback()")
-
-	// Build out the method's arguments
-	goArguments := make([]reflect.Value, 0, 0)
-
-	// Call the parent method.
-
-	goRet := o.callParentMethod(o.baseClass(), "get_fallback", goArguments, "*BitmapFont")
-
-	returnValue := goRet.Interface().(*BitmapFont)
-
-	log.Println("  Got return value: ", returnValue)
-	return returnValue
-
-}
-
-/*
-   BitmapFontImplementer is an interface for BitmapFont objects.
-*/
-type BitmapFontImplementer interface {
-	Class
-}
-
-/*
    Theme for skinning controls. Controls can be skinned individually, but for complex applications it's more efficient to just create a global theme that defines everything. This theme can be applied to any [Control], and it and its children will automatically use it. Theme resources can be alternatively loaded by writing them in a .theme file, see docs for more info.
 */
 type Theme struct {
@@ -27492,6 +26946,596 @@ func (o *Theme) CopyDefaultTheme() {
    ThemeImplementer is an interface for Theme objects.
 */
 type ThemeImplementer interface {
+	Class
+}
+
+/*
+   Font contains a unicode compatible character set, as well as the ability to draw it with variable width, ascent, descent and kerning. For creating fonts from TTF files (or other font formats), see the editor support for fonts. TODO check wikipedia for graph of ascent/baseline/descent/height/etc.
+*/
+type Font struct {
+	Resource
+}
+
+func (o *Font) baseClass() string {
+	return "Font"
+}
+
+/*
+   Draw "string" into a canvas item using the font at a given position, with "modulate" color, and optionally clipping the width. "position" specifies the baseline, not the top. To draw from the top, [i]ascent[/i] must be added to the Y axis.
+*/
+func (o *Font) Draw(canvasItem *RID, pos *Vector2, string string, modulate *Color, clipW int64) {
+	log.Println("Calling Font.Draw()")
+
+	// Build out the method's arguments
+	goArguments := make([]reflect.Value, 5, 5)
+	goArguments[0] = reflect.ValueOf(canvasItem)
+	goArguments[1] = reflect.ValueOf(pos)
+	goArguments[2] = reflect.ValueOf(string)
+	goArguments[3] = reflect.ValueOf(modulate)
+	goArguments[4] = reflect.ValueOf(clipW)
+
+	// Call the parent method.
+
+	o.callParentMethod(o.baseClass(), "draw", goArguments, "")
+
+	log.Println("  Function successfully completed.")
+
+}
+
+/*
+   Return the font ascent (number of pixels above the baseline).
+*/
+func (o *Font) GetAscent() float64 {
+	log.Println("Calling Font.GetAscent()")
+
+	// Build out the method's arguments
+	goArguments := make([]reflect.Value, 0, 0)
+
+	// Call the parent method.
+
+	goRet := o.callParentMethod(o.baseClass(), "get_ascent", goArguments, "float64")
+
+	returnValue := goRet.Interface().(float64)
+
+	log.Println("  Got return value: ", returnValue)
+	return returnValue
+
+}
+
+/*
+   Return the font descent (number of pixels below the baseline).
+*/
+func (o *Font) GetDescent() float64 {
+	log.Println("Calling Font.GetDescent()")
+
+	// Build out the method's arguments
+	goArguments := make([]reflect.Value, 0, 0)
+
+	// Call the parent method.
+
+	goRet := o.callParentMethod(o.baseClass(), "get_descent", goArguments, "float64")
+
+	returnValue := goRet.Interface().(float64)
+
+	log.Println("  Got return value: ", returnValue)
+	return returnValue
+
+}
+
+/*
+   Return the total font height (ascent plus descent) in pixels.
+*/
+func (o *Font) GetHeight() float64 {
+	log.Println("Calling Font.GetHeight()")
+
+	// Build out the method's arguments
+	goArguments := make([]reflect.Value, 0, 0)
+
+	// Call the parent method.
+
+	goRet := o.callParentMethod(o.baseClass(), "get_height", goArguments, "float64")
+
+	returnValue := goRet.Interface().(float64)
+
+	log.Println("  Got return value: ", returnValue)
+	return returnValue
+
+}
+
+/*
+
+ */
+func (o *Font) IsDistanceFieldHint() bool {
+	log.Println("Calling Font.IsDistanceFieldHint()")
+
+	// Build out the method's arguments
+	goArguments := make([]reflect.Value, 0, 0)
+
+	// Call the parent method.
+
+	goRet := o.callParentMethod(o.baseClass(), "is_distance_field_hint", goArguments, "bool")
+
+	returnValue := goRet.Interface().(bool)
+
+	log.Println("  Got return value: ", returnValue)
+	return returnValue
+
+}
+
+/*
+   Return the size of a string, taking kerning and advance into account.
+*/
+func (o *Font) GetStringSize(string string) *Vector2 {
+	log.Println("Calling Font.GetStringSize()")
+
+	// Build out the method's arguments
+	goArguments := make([]reflect.Value, 1, 1)
+	goArguments[0] = reflect.ValueOf(string)
+
+	// Call the parent method.
+
+	goRet := o.callParentMethod(o.baseClass(), "get_string_size", goArguments, "*Vector2")
+
+	returnValue := goRet.Interface().(*Vector2)
+
+	log.Println("  Got return value: ", returnValue)
+	return returnValue
+
+}
+
+/*
+   Draw character "char" into a canvas item using the font at a given position, with "modulate" color, and optionally kerning if "next" is passed. clipping the width. "position" specifies the baseline, not the top. To draw from the top, [i]ascent[/i] must be added to the Y axis. The width used by the character is returned, making this function useful for drawing strings character by character.
+*/
+func (o *Font) DrawChar(canvasItem *RID, pos *Vector2, char int64, next int64, modulate *Color) float64 {
+	log.Println("Calling Font.DrawChar()")
+
+	// Build out the method's arguments
+	goArguments := make([]reflect.Value, 5, 5)
+	goArguments[0] = reflect.ValueOf(canvasItem)
+	goArguments[1] = reflect.ValueOf(pos)
+	goArguments[2] = reflect.ValueOf(char)
+	goArguments[3] = reflect.ValueOf(next)
+	goArguments[4] = reflect.ValueOf(modulate)
+
+	// Call the parent method.
+
+	goRet := o.callParentMethod(o.baseClass(), "draw_char", goArguments, "float64")
+
+	returnValue := goRet.Interface().(float64)
+
+	log.Println("  Got return value: ", returnValue)
+	return returnValue
+
+}
+
+/*
+   After editing a font (changing size, ascent, char rects, etc.). Call this function to propagate changes to controls that might use it.
+*/
+func (o *Font) UpdateChanges() {
+	log.Println("Calling Font.UpdateChanges()")
+
+	// Build out the method's arguments
+	goArguments := make([]reflect.Value, 0, 0)
+
+	// Call the parent method.
+
+	o.callParentMethod(o.baseClass(), "update_changes", goArguments, "")
+
+	log.Println("  Function successfully completed.")
+
+}
+
+/*
+   FontImplementer is an interface for Font objects.
+*/
+type FontImplementer interface {
+	Class
+}
+
+/*
+
+ */
+type BitmapFont struct {
+	Font
+}
+
+func (o *BitmapFont) baseClass() string {
+	return "BitmapFont"
+}
+
+/*
+
+ */
+func (o *BitmapFont) CreateFromFnt(path string) int64 {
+	log.Println("Calling BitmapFont.CreateFromFnt()")
+
+	// Build out the method's arguments
+	goArguments := make([]reflect.Value, 1, 1)
+	goArguments[0] = reflect.ValueOf(path)
+
+	// Call the parent method.
+
+	goRet := o.callParentMethod(o.baseClass(), "create_from_fnt", goArguments, "int64")
+
+	returnValue := goRet.Interface().(int64)
+
+	log.Println("  Got return value: ", returnValue)
+	return returnValue
+
+}
+
+/*
+   Set the total font height (ascent plus descent) in pixels.
+*/
+func (o *BitmapFont) SetHeight(px float64) {
+	log.Println("Calling BitmapFont.SetHeight()")
+
+	// Build out the method's arguments
+	goArguments := make([]reflect.Value, 1, 1)
+	goArguments[0] = reflect.ValueOf(px)
+
+	// Call the parent method.
+
+	o.callParentMethod(o.baseClass(), "set_height", goArguments, "")
+
+	log.Println("  Function successfully completed.")
+
+}
+
+/*
+   Set the font ascent (number of pixels above the baseline).
+*/
+func (o *BitmapFont) SetAscent(px float64) {
+	log.Println("Calling BitmapFont.SetAscent()")
+
+	// Build out the method's arguments
+	goArguments := make([]reflect.Value, 1, 1)
+	goArguments[0] = reflect.ValueOf(px)
+
+	// Call the parent method.
+
+	o.callParentMethod(o.baseClass(), "set_ascent", goArguments, "")
+
+	log.Println("  Function successfully completed.")
+
+}
+
+/*
+   Add a kerning pair to the [BitmapFont] as a difference. Kerning pairs are special cases where a typeface advance is determined by the next character.
+*/
+func (o *BitmapFont) AddKerningPair(charA int64, charB int64, kerning int64) {
+	log.Println("Calling BitmapFont.AddKerningPair()")
+
+	// Build out the method's arguments
+	goArguments := make([]reflect.Value, 3, 3)
+	goArguments[0] = reflect.ValueOf(charA)
+	goArguments[1] = reflect.ValueOf(charB)
+	goArguments[2] = reflect.ValueOf(kerning)
+
+	// Call the parent method.
+
+	o.callParentMethod(o.baseClass(), "add_kerning_pair", goArguments, "")
+
+	log.Println("  Function successfully completed.")
+
+}
+
+/*
+   Return a kerning pair as a difference.
+*/
+func (o *BitmapFont) GetKerningPair(charA int64, charB int64) int64 {
+	log.Println("Calling BitmapFont.GetKerningPair()")
+
+	// Build out the method's arguments
+	goArguments := make([]reflect.Value, 2, 2)
+	goArguments[0] = reflect.ValueOf(charA)
+	goArguments[1] = reflect.ValueOf(charB)
+
+	// Call the parent method.
+
+	goRet := o.callParentMethod(o.baseClass(), "get_kerning_pair", goArguments, "int64")
+
+	returnValue := goRet.Interface().(int64)
+
+	log.Println("  Got return value: ", returnValue)
+	return returnValue
+
+}
+
+/*
+   Add a texture to the [BitmapFont].
+*/
+func (o *BitmapFont) AddTexture(texture *Texture) {
+	log.Println("Calling BitmapFont.AddTexture()")
+
+	// Build out the method's arguments
+	goArguments := make([]reflect.Value, 1, 1)
+	goArguments[0] = reflect.ValueOf(texture)
+
+	// Call the parent method.
+
+	o.callParentMethod(o.baseClass(), "add_texture", goArguments, "")
+
+	log.Println("  Function successfully completed.")
+
+}
+
+/*
+   Add a character to the font, where [i]character[/i] is the unicode value, [i]texture[/i] is the texture index, [i]rect[/i] is the region in the texture (in pixels!), [i]align[/i] is the (optional) alignment for the character and [i]advance[/i] is the (optional) advance.
+*/
+func (o *BitmapFont) AddChar(character int64, texture int64, rect *Rect2, align *Vector2, advance float64) {
+	log.Println("Calling BitmapFont.AddChar()")
+
+	// Build out the method's arguments
+	goArguments := make([]reflect.Value, 5, 5)
+	goArguments[0] = reflect.ValueOf(character)
+	goArguments[1] = reflect.ValueOf(texture)
+	goArguments[2] = reflect.ValueOf(rect)
+	goArguments[3] = reflect.ValueOf(align)
+	goArguments[4] = reflect.ValueOf(advance)
+
+	// Call the parent method.
+
+	o.callParentMethod(o.baseClass(), "add_char", goArguments, "")
+
+	log.Println("  Function successfully completed.")
+
+}
+
+/*
+
+ */
+func (o *BitmapFont) GetTextureCount() int64 {
+	log.Println("Calling BitmapFont.GetTextureCount()")
+
+	// Build out the method's arguments
+	goArguments := make([]reflect.Value, 0, 0)
+
+	// Call the parent method.
+
+	goRet := o.callParentMethod(o.baseClass(), "get_texture_count", goArguments, "int64")
+
+	returnValue := goRet.Interface().(int64)
+
+	log.Println("  Got return value: ", returnValue)
+	return returnValue
+
+}
+
+/*
+
+ */
+func (o *BitmapFont) GetTexture(idx int64) *Texture {
+	log.Println("Calling BitmapFont.GetTexture()")
+
+	// Build out the method's arguments
+	goArguments := make([]reflect.Value, 1, 1)
+	goArguments[0] = reflect.ValueOf(idx)
+
+	// Call the parent method.
+
+	goRet := o.callParentMethod(o.baseClass(), "get_texture", goArguments, "*Texture")
+
+	returnValue := goRet.Interface().(*Texture)
+
+	log.Println("  Got return value: ", returnValue)
+	return returnValue
+
+}
+
+/*
+   Return the size of a character, optionally taking kerning into account if the next character is provided.
+*/
+func (o *BitmapFont) GetCharSize(char int64, next int64) *Vector2 {
+	log.Println("Calling BitmapFont.GetCharSize()")
+
+	// Build out the method's arguments
+	goArguments := make([]reflect.Value, 2, 2)
+	goArguments[0] = reflect.ValueOf(char)
+	goArguments[1] = reflect.ValueOf(next)
+
+	// Call the parent method.
+
+	goRet := o.callParentMethod(o.baseClass(), "get_char_size", goArguments, "*Vector2")
+
+	returnValue := goRet.Interface().(*Vector2)
+
+	log.Println("  Got return value: ", returnValue)
+	return returnValue
+
+}
+
+/*
+
+ */
+func (o *BitmapFont) SetDistanceFieldHint(enable bool) {
+	log.Println("Calling BitmapFont.SetDistanceFieldHint()")
+
+	// Build out the method's arguments
+	goArguments := make([]reflect.Value, 1, 1)
+	goArguments[0] = reflect.ValueOf(enable)
+
+	// Call the parent method.
+
+	o.callParentMethod(o.baseClass(), "set_distance_field_hint", goArguments, "")
+
+	log.Println("  Function successfully completed.")
+
+}
+
+/*
+   Clear all the font data.
+*/
+func (o *BitmapFont) Clear() {
+	log.Println("Calling BitmapFont.Clear()")
+
+	// Build out the method's arguments
+	goArguments := make([]reflect.Value, 0, 0)
+
+	// Call the parent method.
+
+	o.callParentMethod(o.baseClass(), "clear", goArguments, "")
+
+	log.Println("  Function successfully completed.")
+
+}
+
+/*
+   Undocumented
+*/
+func (o *BitmapFont) X_SetChars(arg0 *PoolIntArray) {
+	log.Println("Calling BitmapFont.X_SetChars()")
+
+	// Build out the method's arguments
+	goArguments := make([]reflect.Value, 1, 1)
+	goArguments[0] = reflect.ValueOf(arg0)
+
+	// Call the parent method.
+
+	o.callParentMethod(o.baseClass(), "_set_chars", goArguments, "")
+
+	log.Println("  Function successfully completed.")
+
+}
+
+/*
+   Undocumented
+*/
+func (o *BitmapFont) X_GetChars() *PoolIntArray {
+	log.Println("Calling BitmapFont.X_GetChars()")
+
+	// Build out the method's arguments
+	goArguments := make([]reflect.Value, 0, 0)
+
+	// Call the parent method.
+
+	goRet := o.callParentMethod(o.baseClass(), "_get_chars", goArguments, "*PoolIntArray")
+
+	returnValue := goRet.Interface().(*PoolIntArray)
+
+	log.Println("  Got return value: ", returnValue)
+	return returnValue
+
+}
+
+/*
+   Undocumented
+*/
+func (o *BitmapFont) X_SetKernings(arg0 *PoolIntArray) {
+	log.Println("Calling BitmapFont.X_SetKernings()")
+
+	// Build out the method's arguments
+	goArguments := make([]reflect.Value, 1, 1)
+	goArguments[0] = reflect.ValueOf(arg0)
+
+	// Call the parent method.
+
+	o.callParentMethod(o.baseClass(), "_set_kernings", goArguments, "")
+
+	log.Println("  Function successfully completed.")
+
+}
+
+/*
+   Undocumented
+*/
+func (o *BitmapFont) X_GetKernings() *PoolIntArray {
+	log.Println("Calling BitmapFont.X_GetKernings()")
+
+	// Build out the method's arguments
+	goArguments := make([]reflect.Value, 0, 0)
+
+	// Call the parent method.
+
+	goRet := o.callParentMethod(o.baseClass(), "_get_kernings", goArguments, "*PoolIntArray")
+
+	returnValue := goRet.Interface().(*PoolIntArray)
+
+	log.Println("  Got return value: ", returnValue)
+	return returnValue
+
+}
+
+/*
+   Undocumented
+*/
+func (o *BitmapFont) X_SetTextures(arg0 *Array) {
+	log.Println("Calling BitmapFont.X_SetTextures()")
+
+	// Build out the method's arguments
+	goArguments := make([]reflect.Value, 1, 1)
+	goArguments[0] = reflect.ValueOf(arg0)
+
+	// Call the parent method.
+
+	o.callParentMethod(o.baseClass(), "_set_textures", goArguments, "")
+
+	log.Println("  Function successfully completed.")
+
+}
+
+/*
+   Undocumented
+*/
+func (o *BitmapFont) X_GetTextures() *Array {
+	log.Println("Calling BitmapFont.X_GetTextures()")
+
+	// Build out the method's arguments
+	goArguments := make([]reflect.Value, 0, 0)
+
+	// Call the parent method.
+
+	goRet := o.callParentMethod(o.baseClass(), "_get_textures", goArguments, "*Array")
+
+	returnValue := goRet.Interface().(*Array)
+
+	log.Println("  Got return value: ", returnValue)
+	return returnValue
+
+}
+
+/*
+
+ */
+func (o *BitmapFont) SetFallback(fallback *BitmapFont) {
+	log.Println("Calling BitmapFont.SetFallback()")
+
+	// Build out the method's arguments
+	goArguments := make([]reflect.Value, 1, 1)
+	goArguments[0] = reflect.ValueOf(fallback)
+
+	// Call the parent method.
+
+	o.callParentMethod(o.baseClass(), "set_fallback", goArguments, "")
+
+	log.Println("  Function successfully completed.")
+
+}
+
+/*
+
+ */
+func (o *BitmapFont) GetFallback() *BitmapFont {
+	log.Println("Calling BitmapFont.GetFallback()")
+
+	// Build out the method's arguments
+	goArguments := make([]reflect.Value, 0, 0)
+
+	// Call the parent method.
+
+	goRet := o.callParentMethod(o.baseClass(), "get_fallback", goArguments, "*BitmapFont")
+
+	returnValue := goRet.Interface().(*BitmapFont)
+
+	log.Println("  Got return value: ", returnValue)
+	return returnValue
+
+}
+
+/*
+   BitmapFontImplementer is an interface for BitmapFont objects.
+*/
+type BitmapFontImplementer interface {
 	Class
 }
 
@@ -114380,3473 +114424,3483 @@ var godotToGoConversionMap = map[string]godotToGoConverter{
 	},
 
 	"*Object": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Object{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Reference": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Reference{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*WeakRef": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &WeakRef{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Resource": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Resource{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Image": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Image{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*InputEvent": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &InputEvent{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*InputEventWithModifiers": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &InputEventWithModifiers{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*InputEventKey": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &InputEventKey{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*InputEventMouse": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &InputEventMouse{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*InputEventMouseButton": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &InputEventMouseButton{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*InputEventMouseMotion": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &InputEventMouseMotion{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*InputEventJoypadButton": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &InputEventJoypadButton{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*InputEventJoypadMotion": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &InputEventJoypadMotion{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*InputEventScreenDrag": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &InputEventScreenDrag{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*InputEventScreenTouch": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &InputEventScreenTouch{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*InputEventAction": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &InputEventAction{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*FuncRef": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &FuncRef{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*StreamPeer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &StreamPeer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*StreamPeerBuffer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &StreamPeerBuffer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*StreamPeerTCP": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &StreamPeerTCP{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*TCP_Server": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &TCP_Server{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*PacketPeer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &PacketPeer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*PacketPeerUDP": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &PacketPeerUDP{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*StreamPeerSSL": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &StreamPeerSSL{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ip": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ip{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*PacketPeerStream": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &PacketPeerStream{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*MainLoop": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &MainLoop{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Translation": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Translation{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*PHashTranslation": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &PHashTranslation{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*UndoRedo": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &UndoRedo{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*HTTPClient": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &HTTPClient{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ResourceInteractiveLoader": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ResourceInteractiveLoader{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*TriangleMesh": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &TriangleMesh{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*_File": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &_File{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*_Directory": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &_Directory{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*_Thread": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &_Thread{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*_Mutex": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &_Mutex{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*_Semaphore": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &_Semaphore{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*XMLParser": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &XMLParser{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ConfigFile": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ConfigFile{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*PCKPacker": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &PCKPacker{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*PackedDataContainer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &PackedDataContainer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*PackedDataContainerRef": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &PackedDataContainerRef{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AStar": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AStar{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*EncodedObjectAsID": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &EncodedObjectAsID{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*JSONParseResult": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &JSONParseResult{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*IP_Unix": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &IP_Unix{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*geometry": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &geometry{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*resourceLoader": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &resourceLoader{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*resourceSaver": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &resourceSaver{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*os": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &os{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*engine": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &engine{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*classDb": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &classDb{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*marshalls": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &marshalls{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*json": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &json{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*projectSettings": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &projectSettings{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*inputMap": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &inputMap{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*translationServer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &translationServer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*performance": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &performance{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*visualServer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &visualServer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*PhysicsServerSW": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &PhysicsServerSW{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*physicsServer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &physicsServer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*PhysicsDirectBodyStateSW": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &PhysicsDirectBodyStateSW{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*PhysicsDirectBodyState": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &PhysicsDirectBodyState{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Physics2DServerSW": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Physics2DServerSW{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*physics2DServer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &physics2DServer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Physics2DDirectBodyStateSW": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Physics2DDirectBodyStateSW{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Physics2DDirectBodyState": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Physics2DDirectBodyState{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*audioServer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &audioServer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*InputDefault": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &InputDefault{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*input": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &input{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*arvrServer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &arvrServer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ARVRInterface": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ARVRInterface{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ARVRPositionalTracker": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ARVRPositionalTracker{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ARVRScriptInterface": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ARVRScriptInterface{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioStream": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioStream{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioStreamPlayback": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioStreamPlayback{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioStreamRandomPitch": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioStreamRandomPitch{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioEffect": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioEffect{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioBusLayout": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioBusLayout{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioEffectAmplify": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioEffectAmplify{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioEffectReverb": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioEffectReverb{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioEffectFilter": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioEffectFilter{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioEffectEQ": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioEffectEQ{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioEffectLowPassFilter": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioEffectLowPassFilter{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioEffectHighPassFilter": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioEffectHighPassFilter{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioEffectBandPassFilter": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioEffectBandPassFilter{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioEffectNotchFilter": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioEffectNotchFilter{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioEffectBandLimitFilter": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioEffectBandLimitFilter{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioEffectLowShelfFilter": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioEffectLowShelfFilter{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioEffectHighShelfFilter": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioEffectHighShelfFilter{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioEffectEQ6": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioEffectEQ6{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioEffectEQ10": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioEffectEQ10{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioEffectEQ21": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioEffectEQ21{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioEffectDistortion": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioEffectDistortion{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioEffectStereoEnhance": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioEffectStereoEnhance{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioEffectPanner": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioEffectPanner{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioEffectChorus": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioEffectChorus{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioEffectDelay": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioEffectDelay{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioEffectCompressor": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioEffectCompressor{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioEffectLimiter": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioEffectLimiter{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioEffectPitchShift": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioEffectPitchShift{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioEffectPhaser": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioEffectPhaser{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Physics2DDirectSpaceState": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Physics2DDirectSpaceState{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Physics2DShapeQueryResult": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Physics2DShapeQueryResult{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Physics2DTestMotionResult": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Physics2DTestMotionResult{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Physics2DShapeQueryParameters": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Physics2DShapeQueryParameters{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*PhysicsShapeQueryParameters": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &PhysicsShapeQueryParameters{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*PhysicsDirectSpaceState": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &PhysicsDirectSpaceState{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*PhysicsShapeQueryResult": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &PhysicsShapeQueryResult{}
-		goObject.setOwner(owner)
-
-		return reflect.ValueOf(goObject)
-	},
-
-	"*Font": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
-		goObject := &Font{}
-		goObject.setOwner(owner)
-
-		return reflect.ValueOf(goObject)
-	},
-
-	"*BitmapFont": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
-		goObject := &BitmapFont{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Theme": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Theme{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
+
+		return reflect.ValueOf(goObject)
+	},
+
+	"*Font": func(gdObject unsafe.Pointer) reflect.Value {
+		gdObj := (*C.godot_object)(gdObject)
+		goObject := &Font{}
+		goObject.setGDObj(gdObj)
+
+		return reflect.ValueOf(goObject)
+	},
+
+	"*BitmapFont": func(gdObject unsafe.Pointer) reflect.Value {
+		gdObj := (*C.godot_object)(gdObject)
+		goObject := &BitmapFont{}
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*StyleBoxTexture": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &StyleBoxTexture{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*StyleBox": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &StyleBox{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Panel": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Panel{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*MenuButton": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &MenuButton{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Button": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Button{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*LinkButton": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &LinkButton{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ColorPickerButton": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ColorPickerButton{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*StyleBoxEmpty": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &StyleBoxEmpty{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ToolButton": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ToolButton{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*OptionButton": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &OptionButton{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ProgressBar": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ProgressBar{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ButtonGroup": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ButtonGroup{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*CheckBox": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &CheckBox{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ImageTexture": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ImageTexture{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Texture": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Texture{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*CheckButton": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &CheckButton{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Label": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Label{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*LineEdit": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &LineEdit{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*TextEdit": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &TextEdit{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*HScrollBar": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &HScrollBar{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VScrollBar": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VScrollBar{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*HSlider": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &HSlider{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VSlider": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VSlider{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*PanelContainer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &PanelContainer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*SpinBox": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &SpinBox{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*WindowDialog": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &WindowDialog{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*FileDialog": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &FileDialog{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*PopupPanel": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &PopupPanel{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*PopupMenu": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &PopupMenu{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*GraphNode": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &GraphNode{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Tree": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Tree{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ItemList": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ItemList{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*TabContainer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &TabContainer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Tabs": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Tabs{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*HSeparator": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &HSeparator{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VSeparator": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VSeparator{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ColorPicker": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ColorPicker{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*RichTextLabel": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &RichTextLabel{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VSplitContainer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VSplitContainer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*HSplitContainer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &HSplitContainer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VBoxContainer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VBoxContainer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*HBoxContainer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &HBoxContainer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*MarginContainer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &MarginContainer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*GridContainer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &GridContainer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ReferenceRect": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ReferenceRect{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*GraphEdit": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &GraphEdit{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Node": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
-		goObject := &Node{}
-		goObject.setOwner(owner)
+		var test C.godot_object
+		var testPtr *C.godot_object
+		log.Println("This is our original unsafe pointer: ", gdObject)
+		log.Println("THIS IS A TEST!: ", test)
+		log.Println("This is another, more refined, test: ", testPtr)
 
+		testPtr = (*C.godot_object)(gdObject)
+		test = *testPtr
+		goObject := &Node{}
+		goObject.setGDObj(&test)
+
+		log.Println("This is our original unsafe pointer, again: ", gdObject)
+		log.Println("THIS IS A TEST! AGAIN!: ", test)
+		log.Println("This is another, more refined, test, again: ", testPtr)
 		return reflect.ValueOf(goObject)
 	},
 
 	"*InstancePlaceholder": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &InstancePlaceholder{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Viewport": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Viewport{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*World": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &World{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ViewportTexture": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ViewportTexture{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*HTTPRequest": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &HTTPRequest{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Timer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Timer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*CanvasLayer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &CanvasLayer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*CanvasItem": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &CanvasItem{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Node2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Node2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*CanvasModulate": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &CanvasModulate{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ResourcePreloader": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ResourcePreloader{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Control": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Control{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*BaseButton": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &BaseButton{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ShortCut": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ShortCut{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Range": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Range{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ScrollBar": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ScrollBar{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Slider": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Slider{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Popup": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Popup{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*TextureRect": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &TextureRect{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ColorRect": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ColorRect{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*NinePatchRect": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &NinePatchRect{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*TextureButton": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &TextureButton{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Separator": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Separator{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*BitMap": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &BitMap{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Container": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Container{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*BoxContainer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &BoxContainer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*CenterContainer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &CenterContainer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ScrollContainer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ScrollContainer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*SplitContainer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &SplitContainer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*TextureProgress": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &TextureProgress{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AcceptDialog": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AcceptDialog{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ConfirmationDialog": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ConfirmationDialog{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*TreeItem": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &TreeItem{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VideoPlayer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VideoPlayer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*PopupDialog": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &PopupDialog{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VideoStream": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VideoStream{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ViewportContainer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ViewportContainer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Spatial": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Spatial{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*SpatialGizmo": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &SpatialGizmo{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Skeleton": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Skeleton{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AnimationPlayer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AnimationPlayer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Tween": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Tween{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*BoneAttachment": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &BoneAttachment{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualInstance": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualInstance{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Camera": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Camera{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Listener": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Listener{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ARVRCamera": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ARVRCamera{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ARVRController": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ARVRController{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ARVRAnchor": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ARVRAnchor{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ARVROrigin": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ARVROrigin{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*InterpolatedCamera": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &InterpolatedCamera{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*GeometryInstance": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &GeometryInstance{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*MeshInstance": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &MeshInstance{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Mesh": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Mesh{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ImmediateGeometry": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ImmediateGeometry{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*SpriteBase3D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &SpriteBase3D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Sprite3D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Sprite3D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AnimatedSprite3D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AnimatedSprite3D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*SpriteFrames": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &SpriteFrames{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Light": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Light{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*DirectionalLight": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &DirectionalLight{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*OmniLight": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &OmniLight{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*SpotLight": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &SpotLight{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ReflectionProbe": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ReflectionProbe{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*GIProbe": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &GIProbe{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*GIProbeData": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &GIProbeData{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AnimationTreePlayer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AnimationTreePlayer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Particles": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Particles{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Position3D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Position3D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*NavigationMeshInstance": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &NavigationMeshInstance{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*NavigationMesh": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &NavigationMesh{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Navigation": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Navigation{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*CollisionObject": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &CollisionObject{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*PhysicsBody": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &PhysicsBody{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*StaticBody": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &StaticBody{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*RigidBody": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &RigidBody{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*KinematicCollision": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &KinematicCollision{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*KinematicBody": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &KinematicBody{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VehicleBody": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VehicleBody{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VehicleWheel": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VehicleWheel{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Area": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Area{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ProximityGroup": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ProximityGroup{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*CollisionShape": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &CollisionShape{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Shape": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Shape{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*CollisionPolygon": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &CollisionPolygon{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*RayCast": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &RayCast{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*MultiMeshInstance": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &MultiMeshInstance{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*MultiMesh": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &MultiMesh{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Curve3D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Curve3D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Path": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Path{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*PathFollow": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &PathFollow{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisibilityNotifier": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisibilityNotifier{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisibilityEnabler": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisibilityEnabler{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*WorldEnvironment": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &WorldEnvironment{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Environment": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Environment{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*RemoteTransform": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &RemoteTransform{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Joint": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Joint{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*PinJoint": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &PinJoint{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*HingeJoint": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &HingeJoint{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*SliderJoint": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &SliderJoint{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ConeTwistJoint": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ConeTwistJoint{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Generic6DOFJoint": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Generic6DOFJoint{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*MeshLibrary": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &MeshLibrary{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Shader": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Shader{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Material": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Material{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ShaderMaterial": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ShaderMaterial{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*CanvasItemMaterial": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &CanvasItemMaterial{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Particles2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Particles2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Sprite": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Sprite{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AnimatedSprite": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AnimatedSprite{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Position2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Position2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Line2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Line2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Gradient": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Gradient{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*CollisionObject2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &CollisionObject2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*PhysicsBody2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &PhysicsBody2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*StaticBody2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &StaticBody2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*RigidBody2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &RigidBody2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*KinematicBody2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &KinematicBody2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*KinematicCollision2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &KinematicCollision2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Area2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Area2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*CollisionShape2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &CollisionShape2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Shape2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Shape2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*CollisionPolygon2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &CollisionPolygon2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*RayCast2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &RayCast2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisibilityNotifier2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisibilityNotifier2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisibilityEnabler2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisibilityEnabler2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Polygon2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Polygon2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Light2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Light2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*LightOccluder2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &LightOccluder2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*OccluderPolygon2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &OccluderPolygon2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*YSort": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &YSort{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*BackBufferCopy": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &BackBufferCopy{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Camera2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Camera2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Joint2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Joint2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*PinJoint2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &PinJoint2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*GrooveJoint2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &GrooveJoint2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*DampedSpringJoint2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &DampedSpringJoint2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*TileSet": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &TileSet{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*TileMap": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &TileMap{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ParallaxBackground": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ParallaxBackground{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ParallaxLayer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ParallaxLayer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*TouchScreenButton": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &TouchScreenButton{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*RemoteTransform2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &RemoteTransform2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ArrayMesh": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ArrayMesh{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*PrimitiveMesh": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &PrimitiveMesh{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*CapsuleMesh": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &CapsuleMesh{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*CubeMesh": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &CubeMesh{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*CylinderMesh": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &CylinderMesh{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*PlaneMesh": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &PlaneMesh{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*PrismMesh": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &PrismMesh{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*QuadMesh": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &QuadMesh{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*SphereMesh": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &SphereMesh{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*SpatialMaterial": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &SpatialMaterial{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ParticlesMaterial": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ParticlesMaterial{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*CurveTexture": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &CurveTexture{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*GradientTexture": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &GradientTexture{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*RayShape": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &RayShape{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*SphereShape": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &SphereShape{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*BoxShape": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &BoxShape{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*CapsuleShape": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &CapsuleShape{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*PlaneShape": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &PlaneShape{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ConvexPolygonShape": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ConvexPolygonShape{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ConcavePolygonShape": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ConcavePolygonShape{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*SurfaceTool": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &SurfaceTool{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*MeshDataTool": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &MeshDataTool{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*SpatialVelocityTracker": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &SpatialVelocityTracker{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Sky": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Sky{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*World2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &World2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*PanoramaSky": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &PanoramaSky{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ProceduralSky": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ProceduralSky{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*StreamTexture": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &StreamTexture{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AtlasTexture": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AtlasTexture{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*LargeTexture": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &LargeTexture{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Curve": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Curve{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*CubeMap": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &CubeMap{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Animation": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Animation{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*DynamicFontData": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &DynamicFontData{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*DynamicFont": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &DynamicFont{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*StyleBoxFlat": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &StyleBoxFlat{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*PolygonPathFinder": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &PolygonPathFinder{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioStreamPlayer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioStreamPlayer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioStreamPlayer2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioStreamPlayer2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioStreamPlayer3D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioStreamPlayer3D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioStreamSample": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioStreamSample{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*LineShape2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &LineShape2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*SegmentShape2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &SegmentShape2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*RayShape2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &RayShape2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*CircleShape2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &CircleShape2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*RectangleShape2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &RectangleShape2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*CapsuleShape2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &CapsuleShape2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ConvexPolygonShape2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ConvexPolygonShape2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ConcavePolygonShape2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ConcavePolygonShape2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Curve2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Curve2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Path2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Path2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*PathFollow2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &PathFollow2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Navigation2D": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Navigation2D{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*NavigationPolygon": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &NavigationPolygon{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*NavigationPolygonInstance": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &NavigationPolygonInstance{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*SceneState": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &SceneState{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*PackedScene": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &PackedScene{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*SceneTree": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &SceneTree{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*SceneTreeTimer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &SceneTreeTimer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*EditorPlugin": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &EditorPlugin{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*EditorImportPlugin": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &EditorImportPlugin{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*EditorScript": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &EditorScript{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*EditorSelection": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &EditorSelection{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*EditorFileDialog": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &EditorFileDialog{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*EditorSettings": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &EditorSettings{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*EditorSpatialGizmo": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &EditorSpatialGizmo{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*EditorResourcePreview": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &EditorResourcePreview{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*EditorResourcePreviewGenerator": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &EditorResourcePreviewGenerator{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*EditorFileSystem": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &EditorFileSystem{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*EditorFileSystemDirectory": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &EditorFileSystemDirectory{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ScriptEditor": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ScriptEditor{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*Script": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &Script{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*EditorInterface": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &EditorInterface{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*EditorExportPlugin": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &EditorExportPlugin{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*NetworkedMultiplayerPeer": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &NetworkedMultiplayerPeer{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*NetworkedMultiplayerENet": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &NetworkedMultiplayerENet{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*GDNativeLibrary": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &GDNativeLibrary{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*GDNative": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &GDNative{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*NativeScript": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &NativeScript{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*GDScript": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &GDScript{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*GDFunctionState": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &GDFunctionState{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*GridMap": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &GridMap{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*RegExMatch": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &RegExMatch{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*RegEx": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &RegEx{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ResourceImporterOGGVorbis": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ResourceImporterOGGVorbis{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*ResourceImporter": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &ResourceImporter{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*AudioStreamOGGVorbis": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &AudioStreamOGGVorbis{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScript": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScript{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptNode": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptNode{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptFunctionState": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptFunctionState{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptFunction": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptFunction{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptOperator": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptOperator{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptVariableSet": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptVariableSet{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptVariableGet": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptVariableGet{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptConstant": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptConstant{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptIndexGet": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptIndexGet{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptIndexSet": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptIndexSet{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptGlobalConstant": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptGlobalConstant{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptClassConstant": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptClassConstant{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptMathConstant": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptMathConstant{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptBasicTypeConstant": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptBasicTypeConstant{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptEngineSingleton": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptEngineSingleton{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptSceneNode": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptSceneNode{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptSceneTree": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptSceneTree{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptResourcePath": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptResourcePath{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptSelf": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptSelf{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptCustomNode": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptCustomNode{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptSubCall": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptSubCall{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptComment": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptComment{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptConstructor": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptConstructor{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptLocalVar": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptLocalVar{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptLocalVarSet": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptLocalVarSet{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptInputAction": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptInputAction{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptDeconstruct": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptDeconstruct{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptPreload": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptPreload{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptTypeCast": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptTypeCast{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptFunctionCall": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptFunctionCall{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptPropertySet": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptPropertySet{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptPropertyGet": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptPropertyGet{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptEmitSignal": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptEmitSignal{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptReturn": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptReturn{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptCondition": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptCondition{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptWhile": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptWhile{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptIterator": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptIterator{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptSequence": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptSequence{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptSwitch": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptSwitch{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptSelect": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptSelect{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptYield": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptYield{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptYieldSignal": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptYieldSignal{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptBuiltinFunc": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptBuiltinFunc{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
 
 	"*VisualScriptExpression": func(gdObject unsafe.Pointer) reflect.Value {
-		owner := (*C.godot_object)(gdObject)
+		gdObj := (*C.godot_object)(gdObject)
 		goObject := &VisualScriptExpression{}
-		goObject.setOwner(owner)
+		goObject.setGDObj(gdObj)
 
 		return reflect.ValueOf(goObject)
 	},
